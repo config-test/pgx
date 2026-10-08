@@ -387,13 +387,14 @@ func parseRange(buf *bytes.Buffer) (string, error) {
 			return "", err
 		}
 
-		if escaped {
+		switch {
+		case escaped:
 			escaped = false
-		} else if r == '\\' {
+		case r == '\\':
 			escaped = true
-		} else if r == '"' {
+		case r == '"':
 			inQuotes = !inQuotes
-		} else if !inQuotes {
+		case !inQuotes:
 			switch r {
 			case '[', '(':
 				inRange = true

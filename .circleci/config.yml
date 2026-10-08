@@ -1,0 +1,79 @@
+version: 2.1
+
+jobs:
+  pgx:
+    docker:
+      - image: cimg/go:1.27
+      - image: cimg/postgres:18.0
+        environment:
+          POSTGRES_DB: pgx_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+    environment:
+      PGX_TEST_DATABASE: "host=127.0.0.1 user=postgres dbname=pgx_test sslmode=disable"
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - go-1.27-v1-{{ checksum "go.sum" }}
+      - run:
+          name: Install dependencies and the repo's pinned linter
+          command: |
+            go mod download
+            go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
+      - save_cache:
+          key: go-1.27-v1-{{ checksum "go.sum" }}
+          paths:
+            - /home/circleci/go/pkg/mod
+            - /home/circleci/.cache/go-build
+      # No standalone build command is defined; go test compiles every package.
+      - run:
+          name: Prepare PostgreSQL test fixtures
+          command: |
+            # Use the repo's Go driver: the Go image does not include psql.
+            # Keep this temporary helper outside the module's package tree.
+            cat > /tmp/pgx-ci-setup.go \<<'GO'
+            package main
+
+            import (
+              "context"
+              "log"
+              "os"
+              "regexp"
+              "time"
+
+              "github.com/jackc/pgx/v5/pgconn"
+            )
+
+            func main() {
+              ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+              defer cancel()
+              var conn *pgconn.PgConn
+              var err error
+              for ctx.Err() == nil {
+                conn, err = pgconn.Connect(ctx, os.Getenv("PGX_TEST_DATABASE"))
+                if err == nil { break }
+                time.Sleep(time.Second)
+              }
+              if err != nil { log.Fatal(err) }
+              defer conn.Close(context.Background())
+              sql, err := os.ReadFile("testsetup/postgresql_setup.sql")
+              if err != nil { log.Fatal(err) }
+              // The psql-only OS-user block is unnecessary for TCP as postgres.
+              sql = regexp.MustCompile(`(?s)\\set whoami.*?\\gexec`).ReplaceAll(sql, nil)
+              if _, err = conn.Exec(ctx, string(sql)).ReadAll(); err != nil { log.Fatal(err) }
+            }
+            GO
+            go run /tmp/pgx-ci-setup.go
+      - run:
+          name: Test
+          # Underlying command from scripts/runtests.rb, without the local supervisor.
+          # Optional TLS, Unix-socket, OAuth and PgBouncer tests skip unless configured.
+          command: go test -count=1 ./...
+      - run:
+          name: Lint
+          command: golangci-lint run ./...
+
+workflows:
+  ci:
+    jobs:
+      - pgx
