@@ -1,0 +1,94 @@
+version: 2.1
+
+# Starter pipeline for pgx. One job: build, test and format-check the Go module against a
+# PostgreSQL 18 service container. Deliberately minimal -- no Go/PostgreSQL matrix, no Windows,
+# no PgBouncer job, no deploy. Those can be layered on later.
+
+jobs:
+  pgx:
+    docker:
+      # Go 1.27 is what mise.toml pins and the newest version this repo's CI exercised.
+      # go.mod requires 1.25.0 or newer.
+      - image: cimg/go:1.27
+        environment:
+          # The one connection string every integration test needs. Without it the suite fails
+          # rather than skips. The auth-specific strings (TLS, SCRAM, MD5, unix socket, OAuth,
+          # PgBouncer) are intentionally unset, so those tests skip.
+          PGX_TEST_DATABASE: host=127.0.0.1 port=5432 user=postgres password=secret dbname=pgx_test
+
+      # The default test target in this repo is PostgreSQL 18.
+      - image: cimg/postgres:18.0
+        environment:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: pgx_test
+          POSTGRES_PASSWORD: secret
+
+    steps:
+      - checkout
+
+      - restore_cache:
+          keys:
+            - go-mod-v1-{{ checksum "go.sum" }}
+            - go-mod-v1-
+
+      - run:
+          name: Download modules
+          command: go mod download
+
+      - save_cache:
+          key: go-mod-v1-{{ checksum "go.sum" }}
+          paths:
+            - /home/circleci/go/pkg/mod
+
+      - run:
+          name: Wait for PostgreSQL
+          command: |
+            for _ in $(seq 1 60); do
+              if pg_isready -h 127.0.0.1 -p 5432 -U postgres -q; then
+                exit 0
+              fi
+              sleep 1
+            done
+            echo "PostgreSQL did not become ready in time" >&2
+            exit 1
+
+      - run:
+          name: Set up pgx_test (extensions, domains, test roles)
+          # testsetup/postgresql_setup.sql is the same bootstrap the local dev stack and the old
+          # GitHub Actions workflow used.
+          environment:
+            PGPASSWORD: secret
+          command: |
+            psql -h 127.0.0.1 -p 5432 -U postgres -v ON_ERROR_STOP=1 \
+              -f testsetup/postgresql_setup.sql pgx_test
+
+      - run:
+          name: Build
+          command: go build ./...
+
+      - run:
+          name: Test
+          # -race matches this repo's CI. The pgproto3 max-message-size tests already opt out of
+          # the race detector, so peak memory stays around 1GB.
+          command: go test -race ./...
+
+      - run:
+          name: Check formatting
+          # The repo's own gate (CLAUDE.md, and the previous GitHub Actions workflow).
+          command: |
+            gofmt -l -s -w .
+            git diff --exit-code
+
+      # The full linter set in .golangci.yml (govet, ineffassign, unconvert, gocritic, gofumpt)
+      # has never run in CI here, so it is left out of the first green pipeline. To add it:
+      #
+      # - run:
+      #     name: Lint
+      #     command: |
+      #       go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
+      #       golangci-lint run ./...
+
+workflows:
+  build-and-test:
+    jobs:
+      - pgx
