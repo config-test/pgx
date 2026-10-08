@@ -1,0 +1,195 @@
+version: 2.1
+
+# CI for github.com/jackc/pgx/v5 — a single Go module (go.mod at the repo root, go.sum is the
+# lockfile). Tool versions come from the repo itself: mise.toml pins Go and golangci-lint, and
+# ci/setup_test.bash is the project's own database provisioning script.
+#
+# The PostgreSQL/CockroachDB jobs use a machine executor rather than a cimg/go container because
+# ci/setup_test.bash installs PostgreSQL from the PGDG apt repository, rewrites the cluster's
+# pg_hba.conf/postgresql.conf, restarts it via /etc/init.d, and expects a unix socket at
+# /var/run/postgresql; ci/setup_pgbouncer.bash additionally uses systemctl. Ubuntu 22.04 is where
+# those scripts are known to work.
+
+orbs:
+  go: circleci/go@4.0.3
+
+executors:
+  # Linter/formatter only — no database needed. Version matches mise.toml's `go = '1.27.0'`.
+  go-container:
+    docker:
+      - image: cimg/go:1.27.0
+    resource_class: medium
+
+  # Everything that needs a real PostgreSQL/CockroachDB server.
+  linux-db:
+    machine:
+      image: ubuntu-2204:current
+    resource_class: medium
+
+commands:
+  restore-go-modules:
+    parameters:
+      go-version:
+        type: string
+    steps:
+      - restore_cache:
+          keys:
+            - go-mod-v1-<< parameters.go-version >>-{{ checksum "go.sum" }}
+            - go-mod-v1-<< parameters.go-version >>-
+      - run:
+          name: Download modules
+          command: go mod download
+      - save_cache:
+          key: go-mod-v1-<< parameters.go-version >>-{{ checksum "go.sum" }}
+          paths:
+            - ~/go/pkg/mod
+
+jobs:
+  lint:
+    executor: go-container
+    steps:
+      - checkout
+      - restore-go-modules:
+          go-version: "1.27.0"
+      # Same check CI has always run and that CLAUDE.md documents.
+      - run:
+          name: Check formatting
+          command: |
+            gofmt -l -s -w .
+            git status --short
+            git diff --exit-code
+      # golangci-lint version pinned to mise.toml's `golangci-lint = '2.13.2'`.
+      - run:
+          name: Install golangci-lint 2.13.2
+          command: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
+      - run:
+          name: golangci-lint
+          command: golangci-lint run ./...
+
+  test:
+    parameters:
+      pg-version:
+        description: A PostgreSQL major version, or "cockroachdb". Passed to ci/setup_test.bash.
+        type: string
+      go-version:
+        description: Exact Go version to install.
+        type: string
+    executor: linux-db
+    steps:
+      - checkout
+      - go/install:
+          version: << parameters.go-version >>
+      - restore-go-modules:
+          go-version: << parameters.go-version >>
+      # The project's own provisioning script: installs the PostgreSQL major (or CockroachDB),
+      # applies testsetup/*.conf, generates the TLS material and runs testsetup/postgresql_setup.sql.
+      - run:
+          name: Set up database server for testing
+          command: ci/setup_test.bash
+          environment:
+            PGVERSION: << parameters.pg-version >>
+      - when:
+          condition:
+            equal: ["cockroachdb", << parameters.pg-version >>]
+          steps:
+            - run:
+                name: Export PGX_TEST_* for CockroachDB
+                command: |
+                  cat >> "$BASH_ENV" \<<'ENV'
+                  export PGX_TEST_DATABASE="postgresql://root@127.0.0.1:26257/pgx_test?sslmode=disable&experimental_enable_temp_tables=on"
+                  ENV
+      - unless:
+          condition:
+            equal: ["cockroachdb", << parameters.pg-version >>]
+          steps:
+            - run:
+                name: Export PGX_TEST_* for PostgreSQL
+                # These connection strings match the roles created by
+                # testsetup/postgresql_setup.sql and the rules in testsetup/pg_hba.conf.
+                #
+                # PGX_TEST_TLS_CONN_STRING and PGX_TEST_SCRAM_PLUS_CONN_STRING are deliberately
+                # left unset, as they were upstream: TestConnectTLS fails on a hosted runner even
+                # though it passes when the same server is driven interactively. The tests that
+                # read them skip.
+                command: |
+                  cat >> "$BASH_ENV" \<<'ENV'
+                  export PGX_TEST_DATABASE="host=127.0.0.1 user=pgx_md5 password=secret dbname=pgx_test"
+                  export PGX_TEST_UNIX_SOCKET_CONN_STRING="host=/var/run/postgresql dbname=pgx_test"
+                  export PGX_TEST_TCP_CONN_STRING="host=127.0.0.1 user=pgx_md5 password=secret dbname=pgx_test"
+                  export PGX_TEST_SCRAM_PASSWORD_CONN_STRING="host=127.0.0.1 user=pgx_scram password=secret dbname=pgx_test channel_binding=disable"
+                  export PGX_TEST_MD5_PASSWORD_CONN_STRING="host=127.0.0.1 user=pgx_md5 password=secret dbname=pgx_test"
+                  export PGX_TEST_PLAIN_PASSWORD_CONN_STRING="host=127.0.0.1 user=pgx_pw password=secret dbname=pgx_test"
+                  export PGX_SSL_PASSWORD="certpw"
+                  export PGX_TEST_TLS_CLIENT_CONN_STRING="host=localhost user=pgx_sslcert sslmode=verify-full sslrootcert=/tmp/ca.pem sslcert=/tmp/pgx_sslcert.crt sslkey=/tmp/pgx_sslcert.key dbname=pgx_test"
+                  ENV
+      - when:
+          condition:
+            equal: ["18", << parameters.pg-version >>]
+          steps:
+            - run:
+                name: Enable OAuth tests (PostgreSQL 18+)
+                command: echo 'export PGX_TEST_OAUTH="true"' >> "$BASH_ENV"
+      - run:
+          name: go test -race ./...
+          command: |
+            set -o pipefail
+            mkdir -p /tmp/test-output
+            go test -race ./... 2>&1 | tee /tmp/test-output/go-test.log
+      - store_artifacts:
+          path: /tmp/test-output
+          destination: test-output
+
+  test-pgbouncer:
+    executor: linux-db
+    steps:
+      - checkout
+      - go/install:
+          version: "1.27.0"
+      - restore-go-modules:
+          go-version: "1.27.0"
+      - run:
+          name: Set up PostgreSQL 18
+          command: ci/setup_test.bash
+          environment:
+            PGVERSION: "18"
+      - run:
+          name: Set up PgBouncer
+          command: ci/setup_pgbouncer.bash
+      - run:
+          name: Test PgBouncer
+          command: |
+            set -o pipefail
+            mkdir -p /tmp/test-output
+            go test -parallel=1 -race -count=1 \
+              -run 'TestPgbouncer|TestConnContextCanceledCancelsRunningQueryOnServer' ./... \
+              2>&1 | tee /tmp/test-output/go-test-pgbouncer.log
+          environment:
+            PGX_TEST_DATABASE: "host=127.0.0.1 user=pgx_md5 password=secret dbname=pgx_test"
+            PGX_TEST_PGBOUNCER_CONN_STRING: "host=127.0.0.1 port=6432 user=pgx_md5 password=secret dbname=pgx_test"
+      - store_artifacts:
+          path: /tmp/test-output
+          destination: test-output
+
+workflows:
+  ci:
+    jobs:
+      - lint
+
+      # Every database target ./test.sh knows about, on the Go version mise.toml pins. All of
+      # these start at once; none of them depend on the others.
+      - test:
+          name: test-<< matrix.pg-version >>
+          matrix:
+            parameters:
+              pg-version: ["14", "15", "16", "17", "18", "cockroachdb"]
+              go-version: ["1.27.0"]
+
+      # The other supported Go versions, against the default target.
+      - test:
+          name: test-18-go<< matrix.go-version >>
+          matrix:
+            parameters:
+              pg-version: ["18"]
+              go-version: ["1.25.0", "1.26.3"]
+
+      - test-pgbouncer
