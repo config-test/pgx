@@ -1,0 +1,68 @@
+version: 2.1
+
+jobs:
+  test:
+    docker:
+      # Primary container: go.mod declares `go 1.25.0`, so 1.25 is the floor the module targets.
+      - image: cimg/go:1.25
+        environment:
+          # The integration suite needs a real server. Everything else the suite can use
+          # (PGX_TEST_UNIX_SOCKET_CONN_STRING, the SCRAM/MD5/TLS strings, PGX_TEST_PGBOUNCER_CONN_STRING)
+          # is deliberately left unset, so those tests skip. See CONTRIBUTING.md.
+          #
+          # Port 5432 is correct here and only here: a CircleCI service container always listens on
+          # its default port. The per-checkout ports in .dev/ports.env are a local-development
+          # concern and have no meaning in CI.
+          PGX_TEST_DATABASE: host=127.0.0.1 port=5432 user=pgx_md5 password=secret dbname=pgx_test
+
+      # Service container: PostgreSQL 18, the repo's default test target.
+      - image: cimg/postgres:18.0
+        environment:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: pgx_test
+          # No password anywhere in this config. Trust also keeps testsetup/postgresql_setup.sql
+          # working as written: it stores pgx_md5's password with `password_encryption = md5`,
+          # which the stock pg_hba.conf (scram-sha-256) would reject.
+          POSTGRES_HOST_AUTH_METHOD: trust
+
+    steps:
+      - checkout
+
+      - restore_cache:
+          keys:
+            - go-mod-v1-{{ checksum "go.sum" }}
+
+      - run:
+          name: Download modules
+          command: go mod download
+
+      - run:
+          name: Wait for PostgreSQL
+          # pg_isready ships with the postgresql-client already in cimg/base.
+          command: |
+            for _ in $(seq 1 60); do
+              pg_isready -h 127.0.0.1 -p 5432 -U postgres && exit 0
+              sleep 1
+            done
+            echo "PostgreSQL did not become ready in 60s" >&2
+            exit 1
+
+      - run:
+          name: Initialize test database
+          # Creates the hstore/ltree extensions, the uint64 domain, and the test roles the suite
+          # expects. Same script the local dev environment and the old GitHub Actions job used.
+          command: psql -h 127.0.0.1 -p 5432 -U postgres -v ON_ERROR_STOP=1 -f testsetup/postgresql_setup.sql pgx_test
+
+      - run:
+          name: Test
+          command: go test ./...
+
+      - save_cache:
+          key: go-mod-v1-{{ checksum "go.sum" }}
+          paths:
+            - /home/circleci/go/pkg/mod
+
+workflows:
+  ci:
+    jobs:
+      - test
