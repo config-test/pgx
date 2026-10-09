@@ -1,0 +1,59 @@
+version: 2.1
+
+jobs:
+  go:
+    docker:
+      # Matches mise.toml; includes golangci-lint.
+      - image: cimg/go:1.27
+      - image: postgres:18
+        environment:
+          POSTGRES_DB: pgx_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        # Minimal existing-server setup from CONTRIBUTING.md.
+        command:
+          - bash
+          - -ec
+          - |
+            printf '%s\n' \
+              'CREATE EXTENSION hstore;' \
+              'CREATE EXTENSION ltree;' \
+              'CREATE DOMAIN uint64 AS numeric(20,0);' \
+              > /docker-entrypoint-initdb.d/pgx.sql
+            exec docker-entrypoint.sh postgres
+    environment:
+      PGX_TEST_DATABASE: "host=127.0.0.1 port=5432 user=postgres dbname=pgx_test sslmode=disable"
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - go-v1-1.27-{{ arch }}-{{ checksum "go.sum" }}-{{ checksum "go.mod" }}
+      - run:
+          name: Install dependencies
+          command: go mod download
+      - save_cache:
+          key: go-v1-1.27-{{ arch }}-{{ checksum "go.sum" }}-{{ checksum "go.mod" }}
+          paths:
+            - /home/circleci/go/pkg/mod
+      # No separate root build command: go test compiles the module.
+      - run:
+          name: Wait for PostgreSQL
+          command: |
+            for attempt in {1..60}; do
+              if (echo > /dev/tcp/127.0.0.1/5432) 2>/dev/null; then
+                exit 0
+              fi
+              sleep 1
+            done
+            echo "PostgreSQL did not become ready" >&2
+            exit 1
+      - run:
+          name: Test
+          command: go test ./...
+      - run:
+          name: Lint
+          command: golangci-lint run ./...
+
+workflows:
+  ci:
+    jobs:
+      - go
